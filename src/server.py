@@ -7,75 +7,116 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
+import threading
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
-from src.carbon_estimator import measure_inference_carbon
 from src.database import init_db
 from src.guardrails import TokenHealingLayer
 
 
 LOGGER = logging.getLogger(__name__)
 DATABASE_PATH = Path(r"C:\Users\srina\Downloads\PROMPT OPTIMIZATION\project\data\results.db")
-POOL_SIZE = 4
+WRITE_QUEUE_SIZE = 1024
 
 
-class SQLiteConnectionPool:
-    def __init__(self, db_path: Path, pool_size: int = POOL_SIZE):
+class SQLiteWriteQueue:
+    def __init__(self, db_path: Path, maxsize: int = WRITE_QUEUE_SIZE):
         self.db_path = db_path
-        self.pool_size = pool_size
-        self._connections: list[sqlite3.Connection] = []
-        self._available: Queue[sqlite3.Connection] = Queue(maxsize=pool_size)
-        self._closed = False
-
-        for _ in range(pool_size):
-            connection = self._create_connection()
-            self._connections.append(connection)
-            self._available.put(connection)
+        self.queue: Queue[dict | None] = Queue(maxsize=maxsize)
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(target=self._run, name="sqlite-write-worker", daemon=True)
+        self._connection = self._create_connection()
+        self._worker.start()
 
     def _create_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
-        connection.execute("PRAGMA busy_timeout=3000")
+        connection.execute("PRAGMA busy_timeout=5000")
         return connection
 
-    def acquire(self) -> sqlite3.Connection:
-        if self._closed:
-            raise RuntimeError("SQLite connection pool is closed")
-        return self._available.get()
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                job = self.queue.get(timeout=0.5)
+            except Empty:
+                continue
 
-    def release(self, connection: sqlite3.Connection) -> None:
-        if self._closed:
-            connection.close()
+            if job is None:
+                self.queue.task_done()
+                break
+
+            try:
+                self._connection.execute(
+                    """
+                    INSERT INTO benchmark_results (
+                        created_at,
+                        category,
+                        original_prompt,
+                        compressed_prompt,
+                        original_tokens,
+                        compressed_tokens,
+                        compression_ratio,
+                        compression_latency_seconds,
+                        baseline_latency_seconds,
+                        optimized_latency_seconds,
+                        latency_saved_ms,
+                        reference_response,
+                        candidate_response,
+                        bert_f1_score,
+                        carbon_footprint_g,
+                        simulated_cost,
+                        token_savings,
+                        payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    job["values"],
+                )
+                self._connection.commit()
+            except Exception:
+                LOGGER.exception("SQLite write queue failed to persist telemetry")
+            finally:
+                self.queue.task_done()
+
+    def submit(self, values: tuple) -> None:
+        if self._stop_event.is_set():
             return
-        self._available.put(connection)
+        self.queue.put(
+            {
+                "values": values,
+            }
+        )
 
     def close(self) -> None:
-        self._closed = True
-        for connection in self._connections:
-            try:
-                connection.close()
-            except Exception:
-                LOGGER.exception("Failed to close SQLite connection cleanly")
+        self._stop_event.set()
+        try:
+            self.queue.put_nowait(None)
+        except Exception:
+            pass
+        self._worker.join(timeout=5.0)
+        try:
+            self._connection.close()
+        except Exception:
+            LOGGER.exception("Failed to close SQLite write queue connection cleanly")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
         init_db(DATABASE_PATH)
-        app.state.db_pool = SQLiteConnectionPool(DATABASE_PATH)
+        app.state.db_writer = SQLiteWriteQueue(DATABASE_PATH)
     except Exception:
-        LOGGER.exception("Database pool initialization failed; telemetry persistence will be disabled")
-        app.state.db_pool = None
+        LOGGER.exception("Database queue initialization failed; telemetry persistence will be disabled")
+        app.state.db_writer = None
 
     yield
 
-    db_pool = getattr(app.state, "db_pool", None)
-    if db_pool is not None:
-        db_pool.close()
+    db_writer = getattr(app.state, "db_writer", None)
+    if db_writer is not None:
+        db_writer.close()
 
 
 app = FastAPI(title="Carbon-Aware Prompt Optimization Engine Proxy Gateway", version="2.0", lifespan=lifespan)
@@ -131,7 +172,7 @@ def _compress_with_fallback(
         }
 
 
-def _persist_background_telemetry(
+def _enqueue_background_telemetry(
     original_prompt: str,
     compressed_prompt: str,
     original_tokens: int,
@@ -145,8 +186,8 @@ def _persist_background_telemetry(
     Asynchronously pipelines evaluations and telemetry processing
     outside the critical runtime client performance path.
     """
-    db_pool = getattr(app.state, "db_pool", None)
-    if db_pool is None:
+    db_writer = getattr(app.state, "db_writer", None)
+    if db_writer is None:
         return
 
     try:
@@ -158,6 +199,8 @@ def _persist_background_telemetry(
             from src.evaluator import evaluate_semantic_fidelity
 
             f1_score = evaluate_semantic_fidelity(ref_response, cand_response)
+        from src.carbon_estimator import measure_inference_carbon
+
         carbon_metrics = measure_inference_carbon(time.sleep, max(0.0, latency_saved_ms) / 1000.0)
         token_delta = max(original_tokens - compressed_tokens, 0)
         simulated_cost_saved = (token_delta / 1000.0) * 0.0015
@@ -167,55 +210,28 @@ def _persist_background_telemetry(
             "production_speed": production_speed,
         }
 
-        connection = db_pool.acquire()
-        try:
-            connection.execute(
-                """
-                INSERT INTO benchmark_results (
-                    created_at,
-                    category,
-                    original_prompt,
-                    compressed_prompt,
-                    original_tokens,
-                    compressed_tokens,
-                    compression_ratio,
-                    compression_latency_seconds,
-                    baseline_latency_seconds,
-                    optimized_latency_seconds,
-                    latency_saved_ms,
-                    reference_response,
-                    candidate_response,
-                    bert_f1_score,
-                    carbon_footprint_g,
-                    simulated_cost,
-                    token_savings,
-                    payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    datetime.now(timezone.utc).isoformat(),
-                    None,
-                    original_prompt,
-                    compressed_prompt,
-                    original_tokens,
-                    compressed_tokens,
-                    1.0 if fallback_used else (compressed_tokens / original_tokens if original_tokens else 1.0),
-                    compression_latency_seconds,
-                    4500.0,
-                    4500.0 if original_tokens == 0 else 4500.0 * (compressed_tokens / original_tokens),
-                    latency_saved_ms,
-                    ref_response,
-                    cand_response,
-                    f1_score,
-                    carbon_metrics.get("carbon_footprint_g", 0.0),
-                    simulated_cost_saved,
-                    token_delta,
-                    json.dumps(payload_json, ensure_ascii=True),
-                ),
+        db_writer.submit(
+            (
+                datetime.now(timezone.utc).isoformat(),
+                None,
+                original_prompt,
+                compressed_prompt,
+                original_tokens,
+                compressed_tokens,
+                1.0 if fallback_used else (compressed_tokens / original_tokens if original_tokens else 1.0),
+                compression_latency_seconds,
+                4500.0,
+                4500.0 if original_tokens == 0 else 4500.0 * (compressed_tokens / original_tokens),
+                latency_saved_ms,
+                ref_response,
+                cand_response,
+                f1_score,
+                carbon_metrics.get("carbon_footprint_g", 0.0),
+                simulated_cost_saved,
+                token_delta,
+                json.dumps(payload_json, ensure_ascii=True),
             )
-            connection.commit()
-        finally:
-            db_pool.release(connection)
+        )
     except Exception:
         LOGGER.exception("Background telemetry persistence failed")
 
@@ -258,17 +274,16 @@ async def handle_chat_completion(
     comp_tokens = compression_result["compressed_tokens"]
     compression_latency_seconds = compression_result["compression_latency_seconds"]
     
-    # Calculate baseline proxy structural balances
-    simulated_raw_latency_ms = 4500.0
-    optimized_expected_latency_ms = simulated_raw_latency_ms * (comp_tokens / orig_tokens) if orig_tokens else simulated_raw_latency_ms
-    latency_saved_ms = max(0.0, simulated_raw_latency_ms - optimized_expected_latency_ms - processing_overhead_ms)
+    # Calculate baseline proxy structural balances without heavy metrics
+    token_delta = max(orig_tokens - comp_tokens, 0)
+    latency_saved_ms = round(token_delta / max(orig_tokens, 1) * 4500.0, 2)
 
     if compression_result["fallback_used"]:
         response.headers["X-Proxy-Fallback"] = "True"
     
     # Route profiling sequences to workers so the active user response stays immediate
     background_tasks.add_task(
-        _persist_background_telemetry,
+        _enqueue_background_telemetry,
         user_payload_text,
         compressed_text,
         orig_tokens,
