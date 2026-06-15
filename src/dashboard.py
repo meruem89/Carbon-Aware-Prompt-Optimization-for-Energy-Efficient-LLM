@@ -74,6 +74,28 @@ else:
 
     st.markdown("---")
 
+    # Hardware Efficiency Profile Metrics
+    max_ram_spike = df["peak_ram_mb"].max() if "peak_ram_mb" in df.columns else None
+    avg_cpu_eff = df["cpu_utilization_pct"].mean() if "cpu_utilization_pct" in df.columns else None
+
+    st.markdown("## 🤖 Underlying Hardware Efficiency Profile")
+    he_col1, he_col2, he_col3 = st.columns([2,2,2])
+    with he_col1:
+        if max_ram_spike is not None:
+            st.metric(label="Max RAM Spike (MB)", value=f"{max_ram_spike:.2f} MB")
+        else:
+            st.info("`peak_ram_mb` column not found in DB.")
+    with he_col2:
+        if avg_cpu_eff is not None:
+            st.metric(label="Avg CPU Utilization (%)", value=f"{avg_cpu_eff:.2f}%")
+        else:
+            st.info("`cpu_utilization_pct` column not found in DB.")
+    with he_col3:
+        samples = len(df) if ("peak_ram_mb" in df.columns or "cpu_utilization_pct" in df.columns) else 0
+        st.metric(label="Hardware Samples", value=f"{samples}")
+
+    st.markdown("---")
+
     # 4. Advanced System Performance Charts
     chart_col1, chart_col2 = st.columns(2)
     
