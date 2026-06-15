@@ -3,3 +3,4 @@ pandas
 llmlingua
 streamlit
 plotly
+psutil
