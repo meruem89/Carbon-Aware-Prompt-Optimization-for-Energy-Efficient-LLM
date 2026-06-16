@@ -2,7 +2,8 @@
 ---
 
 ```markdown
-# Carbon-Aware Prompt Optimization Engine on AMD Silicon
+# Carbon-Aware Prompt Optimization Engine
+
 
 A hardware-aware, research-grade prompt compression proxy designed to exploit the mechanics of the AMD ROCm ecosystem. By intercepting verbose natural language payloads and applying high-speed neural token classification, this system systematically collapses input token sequences, drastically reducing VRAM consumption, pre-fill phase latency, operational costs, and localized carbon emissions.
 
